@@ -10,6 +10,7 @@
 # ---------------------------
 import sys, os
 import re
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/mpl")
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
 if PROJECT_DIR not in sys.path:
@@ -22,7 +23,6 @@ from typing import Any, Optional, Tuple, Type, Dict
 from pathlib import Path
 
 import numpy as np
-import cv2
 from PIL import Image
 import torch
 import torch.nn as nn
@@ -31,6 +31,11 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
 import utm
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 
 # ---------------------------
 # Custom Imports
@@ -45,12 +50,7 @@ from prismatic.models.backbones.llm.prompting import PurePromptBuilder
 from prismatic.training.train_utils import get_current_action_mask, get_next_actions_mask
 from prismatic.vla.constants import ACTION_DIM, NUM_ACTIONS_CHUNK, POSE_DIM, ACTION_PROPRIO_NORMALIZATION_TYPE
 from awq_loader import load_awq_openvla, load_embedding_only_openvla
-from llm_backends import (
-    BaseLLMBackend,
-    LLMBackendInputs,
-    build_llm_backend,
-    validate_trtllm_engine_version,
-)
+from llm_backends import BaseLLMBackend, LLMBackendInputs, build_llm_backend
 from time_checker import (
     LLMProfileResult,
     LLMProfiler,
@@ -84,6 +84,10 @@ except ImportError:
 # ===============================================================
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_DIR = SCRIPT_DIR.parent
+pose_goal = False
+satellite = False
+image_goal = False
+lan_prompt = True
 
 
 def sanitize_instruction_for_path(instruction: str) -> str:
@@ -276,8 +280,14 @@ class Inference:
         goal_image_PIL,
         action_tokenizer,
         processor,
+        vla: nn.Module,
+        action_head: nn.Module,
+        pose_projector: nn.Module,
+        device_id: torch.device,
+        num_patches: int,
         compute_dtype: torch.dtype,
         llm_backend: BaseLLMBackend,
+        llm_warmup_iters: int = 3,
         llm_profiler: Optional[LLMProfiler] = None,
         module_timer: Optional[ModuleTimer] = None,
     ):
@@ -290,8 +300,14 @@ class Inference:
         self.goal_image_PIL = goal_image_PIL
         self.action_tokenizer = action_tokenizer
         self.processor = processor
+        self.vla = vla
+        self.action_head = action_head
+        self.pose_projector = pose_projector
+        self.device_id = device_id
+        self.num_patches = num_patches
         self.compute_dtype = compute_dtype
         self.llm_backend = llm_backend
+        self.llm_warmup_remaining = llm_warmup_iters
         self.llm_profiler = llm_profiler
         self.module_timer = module_timer
         self.last_llm_profile: Optional[LLMProfileResult] = None
@@ -393,13 +409,15 @@ class Inference:
         profile_language_model: bool = False,
         log_output: bool = False,
         waypoint_select: int = 4,
+        current_image: Optional[Image.Image] = None,
+        instruction: Optional[str] = None,
     ):
         thres_dist = 30.0
         metric_waypoint_spacing = 0.1
         self.last_llm_profile = None
 
         # Load current image
-        current_image_PIL = self._load_current_image()
+        current_image_PIL = current_image.copy() if current_image is not None else self._load_current_image()
 
         if pose_goal:
             current_lat = self._env_float("OMNIVLA_CURRENT_LAT", 37.87371258374039)
@@ -432,7 +450,7 @@ class Inference:
             goal_image_PIL = self.make_dummy_goal_image(current_image_PIL)
 
         # Language instruction
-        lan_inst = self.lan_inst_prompt if lan_prompt else "xxxx"
+        lan_inst = instruction if instruction is not None else (self.lan_inst_prompt if lan_prompt else "xxxx")
 
         # Prepare batch
         batch = self.data_transformer_omnivla(
@@ -451,26 +469,33 @@ class Inference:
         if self.llm_profiler is not None and profile_language_model:
             run_llm_profile(
                 self,
-                vla,
-                pose_projector,
-                device_id,
+                self.vla,
+                self.pose_projector,
+                self.device_id,
                 self.module_timer,
                 print_result=save_behavior,
             )
 
-        # Run forward pass
-        actions, modality_id = self.run_forward_pass(
-            vla=vla.eval(),
-            action_head=action_head.eval(),
-            noisy_action_projector=None,
-            pose_projector=pose_projector.eval(),
-            batch=batch,
-            device_id=device_id,
-            use_diffusion=False,
-            use_film=False,
-            num_patches=NUM_PATCHES,
-            modality_id=modality_id,
-        )
+        def forward_once():
+            return self.run_forward_pass(
+                vla=self.vla.eval(),
+                action_head=self.action_head.eval(),
+                noisy_action_projector=None,
+                pose_projector=self.pose_projector.eval(),
+                batch=batch,
+                device_id=self.device_id,
+                use_diffusion=False,
+                use_film=False,
+                num_patches=self.num_patches,
+                modality_id=modality_id,
+            )
+
+        if self.llm_warmup_remaining:
+            print(f"Warming up {self.llm_backend.name}: {self.llm_warmup_remaining} iteration(s)")
+            for _ in range(self.llm_warmup_remaining):
+                forward_once()
+            self.llm_warmup_remaining = 0
+        actions, modality_id = forward_once()
         self.count_id += 1
 
         waypoints = actions.float().cpu().numpy()
@@ -798,6 +823,8 @@ class OmniVLAInferenceNode(Node):
             )
             image_source_desc = f"topic `{self.image_topic}`"
         elif self.image_source == "camera":
+            if cv2 is None:
+                raise ImportError("OpenCV is required when OMNIVLA_IMAGE_SOURCE=camera")
             self._open_internal_camera()
             image_source_desc = "internal camera"
         else:
@@ -916,10 +943,8 @@ class InferenceConfig:
         "OMNIVLA_VLA_PATH",
         str(PROJECT_DIR / "omnivla-original"),
     )
-    awq_llm_path: Optional[str] = os.environ.get(
-        "OMNIVLA_AWQ_LLM_PATH",
-        str(PROJECT_DIR / "models" / "llama2_awq_packed"),
-    )
+    backend: str = os.environ.get("OMNIVLA_BACKEND", "fp16").lower()
+    awq_llm_path: Optional[str] = os.environ.get("OMNIVLA_AWQ_LLM_PATH")
     resume_step: Optional[int] = (
         int(os.environ.get("OMNIVLA_RESUME_STEP"))
         if os.environ.get("OMNIVLA_RESUME_STEP") is not None
@@ -929,15 +954,20 @@ class InferenceConfig:
     #resume_step: Optional[int] = 210000
     use_l1_regression: bool = True
     num_images_in_input: int = 2
-    compute_dtype: str = "bfloat16"
-    awq_fuse_layers: bool = True
-    llm_backend: str = os.environ.get("OMNIVLA_LLM_BACKEND", "tensorrt_llm")
-    trtllm_engine_dir: Optional[str] = os.environ.get("OMNIVLA_TRTLLM_ENGINE_DIR")
-    trtllm_runner_path: Optional[str] = os.environ.get(
-        "OMNIVLA_LLM_EMBED_RUNNER",
-        str(PROJECT_DIR / "runtime" / "trtllm" / "bin" / "llm_embed_inference"),
+    compute_dtype: str = os.environ.get("OMNIVLA_COMPUTE_DTYPE", "float16")
+    awq_fuse_layers: bool = os.environ.get("OMNIVLA_AWQ_FUSE_LAYERS", "0").lower() not in {"0", "false", "no"}
+    trt_engine_dir: Optional[str] = os.environ.get("OMNIVLA_TRT_ENGINE_DIR")
+    trt_runner_path: str = os.environ.get(
+        "OMNIVLA_TRT_RUNNER_PATH",
+        str(PROJECT_DIR / "inference" / "trt_engine" / "bin" / "run_omnivla_engine_dynamic"),
     )
-    trtllm_embedding_path: Optional[str] = os.environ.get("OMNIVLA_TRTLLM_EMBEDDING_PATH")
+    trt_plugin_path: Optional[str] = os.environ.get("OMNIVLA_TRT_PLUGIN_PATH")
+    trt_embedding_path: Optional[str] = os.environ.get("OMNIVLA_TRT_EMBEDDING_PATH")
+    trt_kv_cache_capacity: Optional[int] = (
+        int(os.environ["OMNIVLA_TRT_KV_CACHE_CAPACITY"])
+        if os.environ.get("OMNIVLA_TRT_KV_CACHE_CAPACITY") else None
+    )
+    llm_warmup_iters: int = int(os.environ.get("OMNIVLA_LLM_WARMUP_ITERS", "3"))
     benchmark_warmup_iters: int = int(os.environ.get("OMNIVLA_BENCHMARK_WARMUP_ITERS", "3"))
     benchmark_timed_iters: int = int(os.environ.get("OMNIVLA_BENCHMARK_TIMED_ITERS", "10"))
     enable_llm_profile: bool = os.environ.get("OMNIVLA_ENABLE_LLM_PROFILE", "0").lower() not in {"0", "false", "no"}
@@ -945,6 +975,10 @@ class InferenceConfig:
 
 def define_model(cfg: InferenceConfig) -> None:
     cfg.vla_path = cfg.vla_path.rstrip("/")
+    if cfg.backend not in {"fp16", "awq", "trt"}:
+        raise ValueError("OMNIVLA_BACKEND must be one of: fp16, awq, trt")
+    if cfg.llm_warmup_iters < 0:
+        raise ValueError("OMNIVLA_LLM_WARMUP_ITERS must be non-negative")
     print(f"Loading OpenVLA Model `{cfg.vla_path}`")
     compute_dtype = resolve_compute_dtype(cfg.compute_dtype)
 
@@ -962,11 +996,12 @@ def define_model(cfg: InferenceConfig) -> None:
         f"\tPOSE_DIM: {POSE_DIM}\n"
         f"\tACTION_PROPRIO_NORMALIZATION_TYPE: {ACTION_PROPRIO_NORMALIZATION_TYPE}\n"
         f"\tCOMPUTE_DTYPE: {compute_dtype}\n"
+        f"\tBACKEND: {cfg.backend}\n"
         f"\tAWQ_FUSE_LAYERS: {cfg.awq_fuse_layers}\n"
-        f"\tLLM_BACKEND: {cfg.llm_backend}\n"
-        f"\tTRTLLM_ENGINE_DIR: {cfg.trtllm_engine_dir}\n"
-        f"\tTRTLLM_RUNNER_PATH: {cfg.trtllm_runner_path}\n"
-        f"\tTRTLLM_EMBEDDING_PATH: {cfg.trtllm_embedding_path}"
+        f"\tTRT_ENGINE_DIR: {cfg.trt_engine_dir}\n"
+        f"\tTRT_RUNNER_PATH: {cfg.trt_runner_path}\n"
+        f"\tTRT_PLUGIN_PATH: {cfg.trt_plugin_path}\n"
+        f"\tTRT_EMBEDDING_PATH: {cfg.trt_embedding_path}"
     )
 
     # Register OpenVLA model to HF Auto Classes (not needed if the model is on HF Hub)
@@ -975,22 +1010,23 @@ def define_model(cfg: InferenceConfig) -> None:
     AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
     AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction_MMNv1)
     
-    if cfg.llm_backend.lower() == "tensorrt_llm":
-        if not cfg.trtllm_engine_dir or not cfg.trtllm_embedding_path:
+    if cfg.backend == "trt":
+        if not cfg.trt_engine_dir or not cfg.trt_embedding_path or not cfg.trt_plugin_path:
             raise ValueError(
-                "Set `OMNIVLA_TRTLLM_ENGINE_DIR` and `OMNIVLA_TRTLLM_EMBEDDING_PATH` "
-                "when using the TensorRT LLM backend."
+                "Set `OMNIVLA_TRT_ENGINE_DIR`, `OMNIVLA_TRT_EMBEDDING_PATH`, and "
+                "`OMNIVLA_TRT_PLUGIN_PATH` when using the TensorRT engine backend."
             )
-        validate_trtllm_engine_version(cfg.trtllm_engine_dir)
-        print(f"Loading VLA non-language weights and TRT embedding `{cfg.trtllm_embedding_path}`")
+        print(f"Loading VLA non-language weights and TRT embedding `{cfg.trt_embedding_path}`")
         vla, processor = load_embedding_only_openvla(
             cfg.vla_path,
-            cfg.trtllm_embedding_path,
+            cfg.trt_embedding_path,
             device_id,
             cfg.num_images_in_input,
             compute_dtype,
         )
-    elif cfg.awq_llm_path:
+    elif cfg.backend == "awq":
+        if not cfg.awq_llm_path:
+            raise ValueError("Set OMNIVLA_AWQ_LLM_PATH when OMNIVLA_BACKEND=awq")
         cfg.awq_llm_path = cfg.awq_llm_path.rstrip("/")
         print(f"Loading AWQ LLM `{cfg.awq_llm_path}` without loading original LLM weights")
         vla, processor = load_awq_openvla(
@@ -1039,57 +1075,43 @@ def define_model(cfg: InferenceConfig) -> None:
     # Create Action Tokenizer
     action_tokenizer = ActionTokenizer(processor.tokenizer)
 
-    llm_backend = build_llm_backend(cfg.llm_backend, cfg.trtllm_engine_dir, cfg.trtllm_runner_path)
+    llm_backend = build_llm_backend(
+        "tensorrt_edge" if cfg.backend == "trt" else "pytorch_fast",
+        cfg.trt_engine_dir,
+        cfg.trt_runner_path,
+        cfg.trt_plugin_path,
+        cfg.trt_kv_cache_capacity,
+    )
 
     return vla, action_head, pose_projector, device_id, NUM_PATCHES, action_tokenizer, processor, compute_dtype, llm_backend
 
-# ===============================================================
-# Main Entry
-# ===============================================================
-if __name__ == "__main__":
-    # select modality
-    pose_goal = False
-    satellite = False
-    image_goal = False
-    lan_prompt = True
 
-    # Goal definitions
+def create_inference() -> tuple[Inference, InferenceConfig]:
     lan_inst_prompt = os.environ.get("OMNIVLA_INSTRUCTION", "move toward black office chair")
     if pose_goal:
         goal_lat = float(os.environ.get("OMNIVLA_GOAL_LAT", "37.8738930785863"))
         goal_lon = float(os.environ.get("OMNIVLA_GOAL_LON", "-122.26746181032362"))
-        goal_compass = float(os.environ.get("OMNIVLA_GOAL_COMPASS", "0.0"))
+        goal_compass = -float(os.environ.get("OMNIVLA_GOAL_COMPASS", "0.0")) / 180.0 * math.pi
         goal_utm = utm.from_latlon(goal_lat, goal_lon)
-        goal_compass = -float(goal_compass) / 180.0 * math.pi
     else:
-        goal_utm = None
-        goal_compass = 0.0
+        goal_utm, goal_compass = None, 0.0
 
+    goal_image_PIL = None
     if image_goal:
-        goal_image_path = os.environ.get(
-            "OMNIVLA_GOAL_IMAGE",
-            str(SCRIPT_DIR / "goal_img.jpg"),
-        )
+        goal_image_path = os.environ.get("OMNIVLA_GOAL_IMAGE", str(SCRIPT_DIR / "goal_img.jpg"))
         goal_image_PIL = Image.open(goal_image_path).convert("RGB")
-    else:
-        goal_image_PIL = None
-    save_root = os.environ.get("OMNIVLA_SAVE_DIR", str(SCRIPT_DIR))
-    save_dir = make_unique_instruction_save_dir(save_root, lan_inst_prompt)
-    print(f"Saving inference visualizations to: {save_dir}")
 
-    # Define models (VLA, action_head, pose_projector, processor, etc.)
+    save_dir = make_unique_instruction_save_dir(
+        os.environ.get("OMNIVLA_SAVE_DIR", str(SCRIPT_DIR)), lan_inst_prompt
+    )
     cfg = InferenceConfig()
     model_load_t0 = time.perf_counter()
-    vla, action_head, pose_projector, device_id, NUM_PATCHES, action_tokenizer, processor, compute_dtype, llm_backend = define_model(cfg)
+    vla, action_head, pose_projector, device_id, num_patches, action_tokenizer, processor, compute_dtype, llm_backend = define_model(cfg)
     synchronize_if_cuda(device_id)
-    model_load_elapsed = time.perf_counter() - model_load_t0
-    print(f"Checkpoint load time: {model_load_elapsed:.4f} s")
-
+    print(f"Checkpoint load time: {time.perf_counter() - model_load_t0:.4f} s")
     module_timer = configure_module_timer(vla, pose_projector, action_head, llm_backend, device_id)
     llm_profiler = create_llm_profiler(vla, llm_backend, device_id, cfg.enable_llm_profile)
-
-    # Run inference
-    inference = Inference(
+    return Inference(
         save_dir=save_dir,
         lan_inst_prompt=lan_inst_prompt,
         goal_utm=goal_utm,
@@ -1097,18 +1119,30 @@ if __name__ == "__main__":
         goal_image_PIL=goal_image_PIL,
         action_tokenizer=action_tokenizer,
         processor=processor,
+        vla=vla,
+        action_head=action_head,
+        pose_projector=pose_projector,
+        device_id=device_id,
+        num_patches=num_patches,
         compute_dtype=compute_dtype,
         llm_backend=llm_backend,
+        llm_warmup_iters=cfg.llm_warmup_iters,
         llm_profiler=llm_profiler,
         module_timer=module_timer,
-    )
+    ), cfg
+
+# ===============================================================
+# Main Entry
+# ===============================================================
+if __name__ == "__main__":
+    inference, cfg = create_inference()
     if cfg.enable_benchmark:
         run_benchmark(
             inference,
-            vla,
-            pose_projector,
-            device_id,
-            module_timer,
+            inference.vla,
+            inference.pose_projector,
+            inference.device_id,
+            inference.module_timer,
             num_warmup=cfg.benchmark_warmup_iters,
             num_iters=cfg.benchmark_timed_iters,
         )
@@ -1130,6 +1164,8 @@ if __name__ == "__main__":
     else:
         image_source = os.environ.get("OMNIVLA_IMAGE_SOURCE", "").lower()
         if image_source == "camera":
+            if cv2 is None:
+                raise ImportError("OpenCV is required when OMNIVLA_IMAGE_SOURCE=camera")
             preloaded_jpeg_lib = preload_jpeg_compat()
             if preloaded_jpeg_lib is None:
                 print("Warning: Failed to preload a libjpeg compatibility library; nvarguscamerasrc may fail to load")

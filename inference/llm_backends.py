@@ -36,6 +36,8 @@ class LLMBackendInputs:
 
 class BaseLLMBackend:
     name = "base"
+    last_llm_inference_ms: Optional[float] = None
+    last_llm_memory_mib: dict[str, float] = {}
 
     def forward_action_hidden_states(self, vla: nn.Module, inputs: LLMBackendInputs) -> torch.Tensor:
         raise NotImplementedError
@@ -53,6 +55,26 @@ def _env_flag(name: str, default: bool = False) -> bool:
     if value is None:
         return default
     return value.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _nvml_process_memory_mib() -> Optional[float]:
+    """Current process GPU occupancy, as reported by nvidia-smi/NVML."""
+    try:
+        output = subprocess.check_output(
+            ["nvidia-smi", "--query-compute-apps=pid,used_gpu_memory", "--format=csv,noheader,nounits"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    for line in output.splitlines():
+        pid, memory = (part.strip() for part in line.split(",", 1))
+        if pid == str(os.getpid()):
+            try:
+                return float(memory)
+            except ValueError:
+                return None
+    return None
 
 
 def _format_index_ranges(indices: list[int], limit: int = 12) -> str:
@@ -155,8 +177,12 @@ def validate_trtllm_engine_version(
 class PyTorchFastLLMBackend(BaseLLMBackend):
     name = "pytorch_fast"
 
+    def __init__(self):
+        self.last_llm_inference_ms: Optional[float] = None
+        self.last_llm_memory_mib: dict[str, float] = {}
+
     def forward_action_hidden_states(self, vla: nn.Module, inputs: LLMBackendInputs) -> torch.Tensor:
-        return vla.forward_action_hidden_states(
+        llm_inputs = vla.prepare_action_forward_inputs(
             input_ids=inputs.input_ids,
             attention_mask=inputs.attention_mask,
             pixel_values=inputs.pixel_values,
@@ -169,6 +195,43 @@ class PyTorchFastLLMBackend(BaseLLMBackend):
             diffusion_timestep_embeddings=inputs.diffusion_timestep_embeddings,
             use_film=inputs.use_film,
         )
+        language_model = getattr(vla.language_model, "model", None)
+        if language_model is None:
+            raise RuntimeError("language_model does not expose a `.model` backbone for fast inference")
+        allocated_before = torch.cuda.memory_allocated() / 2**20
+        reserved_before = torch.cuda.memory_reserved() / 2**20
+        nvml_before = _nvml_process_memory_mib()
+        torch.cuda.reset_peak_memory_stats()
+        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        start.record()
+        output = language_model(
+            input_ids=None,
+            attention_mask=llm_inputs["attention_mask"],
+            position_ids=None,
+            past_key_values=None,
+            inputs_embeds=llm_inputs["inputs_embeds"],
+            use_cache=False,
+            output_attentions=False,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+        end.record()
+        end.synchronize()
+        self.last_llm_inference_ms = start.elapsed_time(end)
+        self.last_llm_memory_mib = {
+            "torch_allocated_before": allocated_before,
+            "torch_allocated_after": torch.cuda.memory_allocated() / 2**20,
+            "torch_peak_allocated": torch.cuda.max_memory_allocated() / 2**20,
+            "torch_peak_allocated_delta": max(torch.cuda.max_memory_allocated() / 2**20 - allocated_before, 0.0),
+            "torch_reserved_before": reserved_before,
+            "torch_peak_reserved": torch.cuda.max_memory_reserved() / 2**20,
+        }
+        if nvml_before is not None:
+            self.last_llm_memory_mib["nvml_process_before"] = nvml_before
+        nvml_after = _nvml_process_memory_mib()
+        if nvml_after is not None:
+            self.last_llm_memory_mib["nvml_process_after"] = nvml_after
+        return output.last_hidden_state
 
     def profile_target(self, vla: nn.Module) -> Optional[nn.Module]:
         language_model = getattr(vla, "language_model", None)
@@ -510,10 +573,103 @@ class TensorRTLLMBackend(BaseLLMBackend):
         return lines
 
 
+class TensorRTEdgeBackend(TensorRTLLMBackend):
+    """Run the validated OmniVLA TensorRT-Edge-LLM engine subprocess."""
+
+    name = "tensorrt_edge"
+
+    def __init__(self, engine_dir: str, plugin_path: str, runner_path: str, kv_cache_capacity: Optional[int] = None):
+        self.engine_dir = engine_dir
+        self.plugin_path = plugin_path
+        self.runner_path = runner_path
+        self._engine_config = self._load_engine_config()
+        builder_config = self._engine_config.get("builder_config", {})
+        self.kv_cache_capacity = kv_cache_capacity or int(
+            builder_config.get("max_kv_cache_capacity", builder_config.get("max_input_len", 320))
+        )
+        self.last_llm_inference_ms: Optional[float] = None
+        self.last_llm_memory_mib: dict[str, float] = {}
+        required = [
+            os.path.join(self.engine_dir, "llm.engine"),
+            os.path.join(self.engine_dir, "config.json"),
+            self.plugin_path,
+            self.runner_path,
+        ]
+        missing = [path for path in required if not os.path.isfile(path)]
+        if missing:
+            raise FileNotFoundError("TensorRT engine backend is missing required file(s): " + ", ".join(missing))
+
+    def forward_action_hidden_states(self, vla: nn.Module, inputs: LLMBackendInputs) -> torch.Tensor:
+        llm_inputs = self._prepare_action_forward_inputs(vla, inputs)
+        full_embeds = llm_inputs["inputs_embeds"].detach()
+        attention_mask = llm_inputs["attention_mask"].detach().to(torch.bool)
+        if full_embeds.shape[0] != 1:
+            raise ValueError(f"TensorRT engine backend supports batch_size=1, got {full_embeds.shape[0]}")
+
+        valid_indices = attention_mask.nonzero(as_tuple=False)[:, 1]
+        compact_embeds = full_embeds.index_select(1, valid_indices).cpu().to(torch.float16).contiguous()
+        sequence_length = int(compact_embeds.shape[1])
+        if sequence_length > self.kv_cache_capacity:
+            raise ValueError(
+                f"Engine sequence length {sequence_length} exceeds KV cache capacity {self.kv_cache_capacity}"
+            )
+
+        half_dim = 64
+        inv_freq = 1.0 / (10000.0 ** (torch.arange(half_dim, dtype=torch.float32) / half_dim))
+        phases = valid_indices.cpu().to(torch.float32).unsqueeze(-1) * inv_freq.unsqueeze(0)
+        rope = torch.cat((phases.cos(), phases.sin()), dim=-1).unsqueeze(0)
+
+        with tempfile.TemporaryDirectory(prefix="omnivla_trt_engine_") as tmpdir:
+            input_dir = Path(tmpdir) / "input"
+            output_dir = Path(tmpdir) / "output"
+            input_dir.mkdir()
+            compact_embeds.numpy().tofile(input_dir / "inputs_embeds_fp16.bin")
+            padded_rope = torch.zeros((1, self.kv_cache_capacity, rope.shape[-1]), dtype=torch.float32)
+            padded_rope[:, :sequence_length] = rope
+            padded_rope.numpy().tofile(input_dir / "rope_rotary_cos_sin_fp32.bin")
+            completed = subprocess.run(
+                [
+                    self.runner_path, os.path.join(self.engine_dir, "llm.engine"), self.plugin_path,
+                    str(input_dir), str(output_dir), str(sequence_length), str(self.kv_cache_capacity),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if completed.returncode != 0:
+                raise RuntimeError(f"TensorRT engine failed: {completed.stderr[-2000:]}")
+            self.last_llm_inference_ms = next(
+                (float(line.split("=", 1)[1]) for line in completed.stdout.splitlines() if line.startswith("engine_enqueue_ms=")),
+                None,
+            )
+            if self.last_llm_inference_ms is None:
+                raise RuntimeError("TensorRT engine did not report engine_enqueue_ms")
+            self.last_llm_memory_mib = {
+                key: float(line.split("=", 1)[1])
+                for line in completed.stdout.splitlines()
+                if line.startswith("engine_cuda_used_mib_")
+                for key in [line.split("=", 1)[0]]
+            }
+            hidden_np = np.fromfile(output_dir / "hidden_states_fp16.bin", dtype=np.float16)
+
+        expected_shape = (1, sequence_length, full_embeds.shape[-1])
+        if hidden_np.size != int(np.prod(expected_shape)):
+            raise RuntimeError(f"TensorRT hidden_states size mismatch: expected {expected_shape}, got {hidden_np.size} values")
+        compact_hidden = torch.from_numpy(hidden_np.reshape(expected_shape)).to(device=full_embeds.device)
+        full_hidden = torch.zeros_like(full_embeds, dtype=compact_hidden.dtype)
+        full_hidden[:, valid_indices, :] = compact_hidden
+        return full_hidden
+
+    def profile_target(self, vla: nn.Module) -> Optional[nn.Module]:
+        return None
+
+
 def build_llm_backend(
     backend_name: str,
     trtllm_engine_dir: Optional[str] = None,
     trtllm_runner_path: Optional[str] = None,
+    trt_plugin_path: Optional[str] = None,
+    trt_kv_cache_capacity: Optional[int] = None,
 ) -> BaseLLMBackend:
     normalized = backend_name.lower()
     if normalized == "pytorch_fast":
@@ -522,4 +678,10 @@ def build_llm_backend(
         if not trtllm_engine_dir:
             raise ValueError("`trtllm_engine_dir` must be set when `llm_backend=tensorrt_llm`.")
         return TensorRTLLMBackend(trtllm_engine_dir, trtllm_runner_path)
+    if normalized == "tensorrt_edge":
+        if not trtllm_engine_dir or not trtllm_runner_path or not trt_plugin_path:
+            raise ValueError("engine, runner, and plugin paths are required for `tensorrt_edge`.")
+        return TensorRTEdgeBackend(
+            trtllm_engine_dir, trt_plugin_path, trtllm_runner_path, trt_kv_cache_capacity
+        )
     raise ValueError(f"Unsupported llm backend `{backend_name}`.")

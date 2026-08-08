@@ -30,3 +30,4 @@ omnivla-edge/
 # Ignore all wandb directories everywhere
 **/wandb/
 .venv
+inference/trt_engine/bin/

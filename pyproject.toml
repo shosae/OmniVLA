@@ -52,6 +52,7 @@ dependencies = [
     "imageio",
     "uvicorn",
     "fastapi",
+    "python-multipart",
     "utm",
     "lmdb",
     "zarr",
