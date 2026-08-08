@@ -731,6 +731,8 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         return self.language_model._reorder_cache(*args, **kwargs)
 
 class PrismaticForConditionalGeneration_MMNv1(PrismaticPreTrainedModel):
+    _supports_sdpa = False
+
     def __init__(self, config: PrismaticConfig) -> None:
         super().__init__(config)
 
@@ -787,10 +789,13 @@ class PrismaticForConditionalGeneration_MMNv1(PrismaticPreTrainedModel):
         self.num_obs_features = self.obs_encoder._fc.in_features        
         self.compress_obs_enc = nn.Linear(self.num_obs_features, self.goal_encoding_size)
         """
-        # Instantiate LLM Backbone
-        self.language_model = AutoModelForCausalLM.from_config(
-            config.text_config, attn_implementation=config._attn_implementation
-        )
+        # Some inference paths inject an AWQ LLM later to avoid loading the full-precision backbone first.
+        if getattr(config, "defer_language_model_init", False):
+            self.language_model = None
+        else:
+            self.language_model = AutoModelForCausalLM.from_config(
+                config.text_config, attn_implementation=config._attn_implementation
+            )
         self.vocab_size = config.text_config.vocab_size
         self.pad_token_id = config.pad_token_id
         self.llm_dim = config.text_config.hidden_size
@@ -818,6 +823,8 @@ class PrismaticForConditionalGeneration_MMNv1(PrismaticPreTrainedModel):
         self.language_model.set_decoder(decoder)
 
     def tie_weights(self) -> None:
+        if self.language_model is None:
+            return
         self.language_model.tie_weights()  # Note: `Llama-2` and `Mistral` don't tie weights (no-op)
 
     def resize_token_embeddings(
@@ -1013,6 +1020,112 @@ class PrismaticForConditionalGeneration_MMNv1(PrismaticPreTrainedModel):
             return torch.cat([labels[:, :1], projected_patch_labels, labels[:, 1:]], dim=1)
         return None
 
+    def prepare_action_forward_inputs(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: torch.Tensor,
+        pixel_values: torch.FloatTensor,
+        labels: torch.LongTensor,
+        modality_id: Optional[torch.FloatTensor] = None,
+        proprio=None,
+        proprio_projector=None,
+        noisy_actions=None,
+        noisy_action_projector=None,
+        diffusion_timestep_embeddings=None,
+        use_film: bool = False,
+        attention_mask_label: Optional[torch.Tensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """Build multimodal embeddings and labels for action inference paths."""
+        assert pixel_values is not None, "pixel_values are required for multimodal inference"
+
+        input_embeddings = self.get_input_embeddings()(input_ids)
+        all_actions_mask = self._process_action_masks(labels)
+
+        language_embeddings = input_embeddings[~all_actions_mask].reshape(
+            input_embeddings.shape[0], -1, input_embeddings.shape[2]
+        )
+        projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+        projected_patch_embeddings = self._process_proprio_features(
+            projected_patch_embeddings, proprio, proprio_projector
+        )
+
+        if diffusion_timestep_embeddings is not None:
+            projected_patch_embeddings = torch.cat(
+                (projected_patch_embeddings, diffusion_timestep_embeddings), dim=1
+            )
+
+        if noisy_actions is not None:
+            batch_size = noisy_actions.shape[0]
+            noisy_actions = noisy_actions.reshape(batch_size, -1).unsqueeze(-1)
+            noisy_action_features = noisy_action_projector(noisy_actions)
+            input_embeddings = self._replace_input_embeddings(
+                input_embeddings, all_actions_mask, noisy_action_features
+            )
+        else:
+            input_embeddings = input_embeddings * ~all_actions_mask.unsqueeze(-1)
+
+        if modality_id is not None:
+            multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_attention_MMN(
+                input_embeddings, projected_patch_embeddings, attention_mask, attention_mask_label, modality_id
+            )
+        else:
+            multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_attention(
+                input_embeddings, projected_patch_embeddings, attention_mask
+            )
+
+        return {
+            "inputs_embeds": multimodal_embeddings,
+            "attention_mask": multimodal_attention_mask,
+            "labels": self._build_multimodal_labels(labels, projected_patch_embeddings),
+            "projected_patch_embeddings": projected_patch_embeddings,
+        }
+
+    def forward_action_hidden_states(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: torch.Tensor,
+        pixel_values: torch.FloatTensor,
+        labels: torch.LongTensor,
+        modality_id: Optional[torch.FloatTensor] = None,
+        proprio=None,
+        proprio_projector=None,
+        noisy_actions=None,
+        noisy_action_projector=None,
+        diffusion_timestep_embeddings=None,
+        use_film: bool = False,
+    ) -> torch.FloatTensor:
+        """Inference-only fast path that skips loss/logits and returns the final hidden states."""
+        llm_inputs = self.prepare_action_forward_inputs(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            pixel_values=pixel_values,
+            labels=labels,
+            modality_id=modality_id,
+            proprio=proprio,
+            proprio_projector=proprio_projector,
+            noisy_actions=noisy_actions,
+            noisy_action_projector=noisy_action_projector,
+            diffusion_timestep_embeddings=diffusion_timestep_embeddings,
+            use_film=use_film,
+        )
+
+        language_model_backbone = getattr(self.language_model, "model", None)
+        if language_model_backbone is None:
+            raise RuntimeError("language_model does not expose a `.model` backbone for fast inference")
+
+        language_model_output = language_model_backbone(
+            input_ids=None,
+            attention_mask=llm_inputs["attention_mask"],
+            position_ids=None,
+            past_key_values=None,
+            inputs_embeds=llm_inputs["inputs_embeds"],
+            use_cache=False,
+            output_attentions=False,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+        return language_model_output.last_hidden_state
+
     # === Core Prismatic VLM `forward()` Logic ===
     def forward(
         self,
@@ -1096,67 +1209,30 @@ class PrismaticForConditionalGeneration_MMNv1(PrismaticPreTrainedModel):
         # === Handle Multimodal Forward ===
         elif (input_ids.shape[0] == pixel_values.shape[0]) or (inputs_embeds.shape[0] == pixel_values.shape[0]):
             assert past_key_values is None, "Unexpected key `past_key_values` provided during multimodal forward!"
-            # Get input embeddings (from language model embeddings)
-            input_embeddings = self.get_input_embeddings()(input_ids)  # (B, seq_len, D)
-            all_actions_mask = self._process_action_masks(labels)
-            # Extract the language portion of the input embeddings (i.e. remove the action tokens portion)
-            language_embeddings = input_embeddings[~all_actions_mask].reshape(
-                input_embeddings.shape[0], -1, input_embeddings.shape[2]
-            )  # (B, lang_seq_len, llm_dim)
-
-            # Get visual features
-            projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
-
-            # Add proprioceptive state if provided
-            projected_patch_embeddings = self._process_proprio_features(
-                projected_patch_embeddings, proprio, proprio_projector
+            llm_inputs = self.prepare_action_forward_inputs(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                pixel_values=pixel_values,
+                labels=labels,
+                modality_id=modality_id,
+                proprio=proprio,
+                proprio_projector=proprio_projector,
+                noisy_actions=noisy_actions,
+                noisy_action_projector=noisy_action_projector,
+                diffusion_timestep_embeddings=diffusion_timestep_embeddings,
+                use_film=use_film,
+                attention_mask_label=attention_mask_label,
             )
-
-            # [Diffusion] Add diffusion timestep embedding if provided
-            if diffusion_timestep_embeddings is not None:
-                # For simplicity, just append diffusion timestep embedding to the end of projected vision patch tokens
-                projected_patch_embeddings = torch.cat(
-                    (projected_patch_embeddings, diffusion_timestep_embeddings), dim=1
-                )
-
-            # Process action embeddings
-            if noisy_actions is not None:
-                # Get mask corresponding to all action tokens
-                all_actions_mask = self._process_action_masks(labels)
-
-                # Reshape noisy actions into individual action tokens
-                # noisy_actions: (B, chunk_len, action_dim) -> (B, chunk_len * action_dim, 1)
-                B = noisy_actions.shape[0]
-                noisy_actions = noisy_actions.reshape(B, -1).unsqueeze(-1)
-
-                # Project noisy action tokens into language model embedding space
-                noisy_action_features = noisy_action_projector(noisy_actions)  # (B, chunk_len * action_dim, llm_dim)
-
-                # Replace embeddings of the action tokens with noisy action embeddings
-                input_embeddings = self._replace_input_embeddings(
-                    input_embeddings, all_actions_mask, noisy_action_features
-                )
-            else: 
-                # Replace the embeddings of the action tokens with zeros
-                # (Later on, the positional embeddings will be added to them)
-                all_actions_mask = all_actions_mask.unsqueeze(-1)  # (B, seq_len, 1)
-                input_embeddings = input_embeddings * ~all_actions_mask
-                
-            # Build multimodal embeddings & attention mask
-            multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_attention_MMN(
-                input_embeddings, projected_patch_embeddings, attention_mask, attention_mask_label, modality_id
-            )            
-            # Build labels for multimodal sequence if needed
-            multimodal_labels = self._build_multimodal_labels(labels, projected_patch_embeddings)
+            projected_patch_embeddings = llm_inputs["projected_patch_embeddings"]
     
             # Dispatch to language model
             language_model_output = self.language_model(
                 input_ids=None,
-                attention_mask=multimodal_attention_mask,
+                attention_mask=llm_inputs["attention_mask"],
                 position_ids=None,
                 past_key_values=None,
-                inputs_embeds=multimodal_embeddings,
-                labels=multimodal_labels,
+                inputs_embeds=llm_inputs["inputs_embeds"],
+                labels=llm_inputs["labels"],
                 use_cache=use_cache,
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,

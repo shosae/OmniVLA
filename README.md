@@ -13,6 +13,19 @@ IEEE International Conference on Robotics and Automation (ICRA) 2026
 ### Installation
 Please set up a conda environment (see instructions in [SETUP.md](SETUP.md)).
 
+#### Jetson AWQ inference
+
+Jetson provides the CUDA-matched Torch packages. After creating a Python 3.10 environment that can access them, install OmniVLA and apply the Llama-only AutoAWQ compatibility patch:
+
+```
+pip install -e .
+pip install --force-reinstall --no-deps git+https://github.com/moojink/transformers-openvla-oft.git
+pip install --no-deps autoawq==0.2.8 zstandard==0.25.0
+python inference/patch_autoawq_440.py
+```
+
+This supports Llama AWQ models only. `autoawq-kernels` has no Jetson/aarch64 wheel; use the installed Triton path.
+
 ### Inference
 1. Download our checkpoints and place them in our directory. "omnivla-original" is the trained checkpoints of the OmniVLA for paper submission. "omnivla-original-balance" contains the trained checkpoints of OmniVLA that account for the data balance in the LeLaN dataset. And "omnivla-finetuned-cast" is finetuned checkpoints with the [CAST](https://huggingface.co/datasets/catglossop/CAST-dataset) dataset.
     ```
