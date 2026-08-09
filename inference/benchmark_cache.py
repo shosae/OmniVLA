@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Replay a shared OmniVLA decoder-input cache through fp16, AWQ, or TensorRT."""
+"""Replay a shared OmniVLA decoder-input cache through fp16, AWQ, GPTQ, or TensorRT."""
 
 from __future__ import annotations
 
@@ -36,6 +36,10 @@ def main() -> None:
     runner, config = omnivla.create_inference()
     device = runner.device_id
 
+    def load_payload(path: Path) -> dict:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        return payload.get("manifest", {}) | payload
+
     def run(payload: dict) -> tuple[torch.Tensor, float, float]:
         embeds = payload["inputs_embeds"].to(device=device, dtype=torch.float16, non_blocking=True)
         mask = payload["attention_mask"].to(device=device, dtype=torch.bool, non_blocking=True)
@@ -57,7 +61,7 @@ def main() -> None:
         return actions, (time.perf_counter() - started) * 1000.0, runner.llm_backend.last_llm_inference_ms
 
     for index in range(args.warmup):
-        payload = torch.load(paths[index % len(paths)], map_location="cpu", weights_only=False)
+        payload = load_payload(paths[index % len(paths)])
         run(payload)
     torch.cuda.synchronize(device)
     torch.cuda.reset_peak_memory_stats(device)
@@ -65,7 +69,7 @@ def main() -> None:
     records = []
     for repeat in range(args.repeats):
         for path in paths:
-            payload = torch.load(path, map_location="cpu", weights_only=False)
+            payload = load_payload(path)
             actions, latency_ms, llm_ms = run(payload)
             records.append({
                 "backend": config.backend,

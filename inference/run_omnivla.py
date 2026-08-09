@@ -40,7 +40,7 @@ from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, Pr
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder
 from prismatic.training.train_utils import get_current_action_mask, get_next_actions_mask
 from prismatic.vla.constants import ACTION_DIM, NUM_ACTIONS_CHUNK, POSE_DIM, ACTION_PROPRIO_NORMALIZATION_TYPE
-from awq_loader import load_awq_openvla, load_embedding_only_openvla
+from backend_loader import load_awq_openvla, load_embedding_only_openvla
 from debug import debug_action_summary
 from llm_backends import (
     BaseLLMBackend,

@@ -109,6 +109,42 @@ def load_awq_openvla(
     return vla, processor
 
 
+def load_gptq_openvla(
+    vla_path: str,
+    gptq_llm_path: str,
+    device: torch.device,
+    num_images_in_input: int,
+    compute_dtype: torch.dtype,
+) -> Tuple[OpenVLAForActionPrediction_MMNv1, object]:
+    from auto_gptq import AutoGPTQForCausalLM
+
+    processor = AutoProcessor.from_pretrained(vla_path, trust_remote_code=True)
+
+    config = AutoConfig.from_pretrained(vla_path, trust_remote_code=True)
+    config.defer_language_model_init = True
+    vla = OpenVLAForActionPrediction_MMNv1(config)
+    _load_non_language_weights(vla, vla_path)
+
+    gptq_model = AutoGPTQForCausalLM.from_quantized(
+        gptq_llm_path,
+        device=str(device),
+        use_safetensors=True,
+        use_triton=False,
+        inject_fused_attention=False,
+        inject_fused_mlp=False,
+        disable_exllama=True,
+        trust_remote_code=True,
+    )
+    vla.language_model = gptq_model.model.eval()
+
+    module_dtype = compute_dtype if device.type == "cuda" else torch.float32
+    vla.vision_backbone.set_num_images_in_input(num_images_in_input)
+    vla.vision_backbone.to(device=device, dtype=module_dtype)
+    vla.projector.to(device=device, dtype=module_dtype)
+    vla.eval()
+    return vla, processor
+
+
 def load_embedding_only_openvla(
     vla_path: str,
     embedding_path: str,

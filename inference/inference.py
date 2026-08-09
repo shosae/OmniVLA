@@ -49,7 +49,7 @@ from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, Pr
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder
 from prismatic.training.train_utils import get_current_action_mask, get_next_actions_mask
 from prismatic.vla.constants import ACTION_DIM, NUM_ACTIONS_CHUNK, POSE_DIM, ACTION_PROPRIO_NORMALIZATION_TYPE
-from awq_loader import load_awq_openvla, load_embedding_only_openvla
+from backend_loader import load_awq_openvla, load_embedding_only_openvla, load_gptq_openvla
 from llm_backends import BaseLLMBackend, LLMBackendInputs, build_llm_backend
 from time_checker import (
     LLMProfileResult,
@@ -945,6 +945,7 @@ class InferenceConfig:
     )
     backend: str = os.environ.get("OMNIVLA_BACKEND", "fp16").lower()
     awq_llm_path: Optional[str] = os.environ.get("OMNIVLA_AWQ_LLM_PATH")
+    gptq_llm_path: Optional[str] = os.environ.get("OMNIVLA_GPTQ_LLM_PATH")
     resume_step: Optional[int] = (
         int(os.environ.get("OMNIVLA_RESUME_STEP"))
         if os.environ.get("OMNIVLA_RESUME_STEP") is not None
@@ -975,8 +976,8 @@ class InferenceConfig:
 
 def define_model(cfg: InferenceConfig) -> None:
     cfg.vla_path = cfg.vla_path.rstrip("/")
-    if cfg.backend not in {"fp16", "awq", "trt"}:
-        raise ValueError("OMNIVLA_BACKEND must be one of: fp16, awq, trt")
+    if cfg.backend not in {"fp16", "awq", "gptq", "trt"}:
+        raise ValueError("OMNIVLA_BACKEND must be one of: fp16, awq, gptq, trt")
     if cfg.llm_warmup_iters < 0:
         raise ValueError("OMNIVLA_LLM_WARMUP_ITERS must be non-negative")
     print(f"Loading OpenVLA Model `{cfg.vla_path}`")
@@ -1036,6 +1037,18 @@ def define_model(cfg: InferenceConfig) -> None:
             cfg.num_images_in_input,
             compute_dtype,
             cfg.awq_fuse_layers,
+        )
+    elif cfg.backend == "gptq":
+        if not cfg.gptq_llm_path:
+            raise ValueError("Set OMNIVLA_GPTQ_LLM_PATH when OMNIVLA_BACKEND=gptq")
+        cfg.gptq_llm_path = cfg.gptq_llm_path.rstrip("/")
+        print(f"Loading GPTQ LLM `{cfg.gptq_llm_path}` without loading original LLM weights")
+        vla, processor = load_gptq_openvla(
+            cfg.vla_path,
+            cfg.gptq_llm_path,
+            device_id,
+            cfg.num_images_in_input,
+            compute_dtype,
         )
     else:
         # Load processor and VLA
