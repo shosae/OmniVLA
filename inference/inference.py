@@ -959,7 +959,7 @@ class InferenceConfig:
     trt_engine_dir: Optional[str] = os.environ.get("OMNIVLA_TRT_ENGINE_DIR")
     trt_runner_path: str = os.environ.get(
         "OMNIVLA_TRT_RUNNER_PATH",
-        str(PROJECT_DIR / "inference" / "trt_engine" / "bin" / "run_omnivla_engine_dynamic"),
+        str(PROJECT_DIR / "inference" / "trt_engine" / "bin" / "run_omnivla_engine_persistent"),
     )
     trt_plugin_path: Optional[str] = os.environ.get("OMNIVLA_TRT_PLUGIN_PATH")
     trt_embedding_path: Optional[str] = os.environ.get("OMNIVLA_TRT_EMBEDDING_PATH")

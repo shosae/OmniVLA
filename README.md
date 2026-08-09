@@ -26,24 +26,27 @@ python inference/patch_autoawq_440.py
 
 This supports Llama AWQ models only. `autoawq-kernels` has no Jetson/aarch64 wheel; use the installed Triton path.
 
-#### Backend-comparison server
+#### Shared-cache benchmark
 
-Use the same `/predict` endpoint for all three backends. `fp16` loads the original Hugging Face LLM, `awq` requires `OMNIVLA_AWQ_LLM_PATH`, and `trt` uses the existing direct TensorRT-Edge-LLM runner (not TensorRT-LLM).
+Replay the same precomputed decoder-input `.pt` cache on a PC or robot. Each JSONL row contains decoder-plus-action-head latency (`latency_ms`), backend-only latency (`llm_inference_ms`), backend memory (`llm_memory_mib`), and predicted actions. Cache reads and host-to-device copies are outside the timing window; the first `--warmup` runs are discarded.
 
 ```bash
-OMNIVLA_BACKEND=fp16 python inference/server_omnivla.py
-OMNIVLA_BACKEND=awq OMNIVLA_AWQ_LLM_PATH=/models/llama2_awq python inference/server_omnivla.py
-./inference/trt_engine/build_runner.sh
-OMNIVLA_BACKEND=trt \
-  OMNIVLA_TRT_ENGINE_DIR=/models/engine \
+OMNIVLA_BACKEND=fp16 python inference/benchmark_cache.py \
+  --cache-dir /home/billy/yong/benchmark --warmup 10 --repeats 1 \
+  --output results/fp16.jsonl
+
+OMNIVLA_BACKEND=awq OMNIVLA_AWQ_LLM_PATH=/models/llama2_awq \
+  python inference/benchmark_cache.py \
+  --cache-dir /home/billy/yong/benchmark --warmup 10 --repeats 1 \
+  --output results/awq.jsonl
+
+OMNIVLA_BACKEND=trt OMNIVLA_TRT_ENGINE_DIR=/models/engine \
   OMNIVLA_TRT_EMBEDDING_PATH=/models/embedding.safetensors \
   OMNIVLA_TRT_PLUGIN_PATH=/path/to/libNvInfer_edgellm_plugin.so \
-  python inference/server_omnivla.py
+  python inference/benchmark_cache.py \
+  --cache-dir /home/billy/yong/benchmark --warmup 10 --repeats 1 \
+  --output results/trt.jsonl
 ```
-
-Set `OMNIVLA_COMPUTE_DTYPE=bf16` only when the checkpoint and engine were built for BF16; the default is FP16.
-The first input warms up the selected backend three times; set `OMNIVLA_LLM_WARMUP_ITERS=0` to disable it.
-`llm_memory_mib` reports PyTorch allocator and NVML process occupancy for FP16/AWQ, and runner CUDA occupancy for TRT.
 
 ### Inference
 1. Download our checkpoints and place them in our directory. "omnivla-original" is the trained checkpoints of the OmniVLA for paper submission. "omnivla-original-balance" contains the trained checkpoints of OmniVLA that account for the data balance in the LeLaN dataset. And "omnivla-finetuned-cast" is finetuned checkpoints with the [CAST](https://huggingface.co/datasets/catglossop/CAST-dataset) dataset.

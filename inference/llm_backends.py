@@ -42,6 +42,12 @@ class BaseLLMBackend:
     def forward_action_hidden_states(self, vla: nn.Module, inputs: LLMBackendInputs) -> torch.Tensor:
         raise NotImplementedError
 
+    def forward_cached_hidden_states(
+        self, inputs_embeds: torch.Tensor, attention_mask: torch.Tensor, vla: Optional[nn.Module] = None
+    ) -> torch.Tensor:
+        """Replay already-prepared decoder inputs for a portable benchmark."""
+        raise NotImplementedError
+
     def profile_target(self, vla: nn.Module) -> Optional[nn.Module]:
         return getattr(vla, "language_model", None)
 
@@ -195,9 +201,16 @@ class PyTorchFastLLMBackend(BaseLLMBackend):
             diffusion_timestep_embeddings=inputs.diffusion_timestep_embeddings,
             use_film=inputs.use_film,
         )
-        language_model = getattr(vla.language_model, "model", None)
+        return self.forward_cached_hidden_states(
+            llm_inputs["inputs_embeds"], llm_inputs["attention_mask"], vla
+        )
+
+    def forward_cached_hidden_states(
+        self, inputs_embeds: torch.Tensor, attention_mask: torch.Tensor, vla: Optional[nn.Module] = None
+    ) -> torch.Tensor:
+        language_model = getattr(getattr(vla, "language_model", None), "model", None)
         if language_model is None:
-            raise RuntimeError("language_model does not expose a `.model` backbone for fast inference")
+            raise RuntimeError("PyTorch cache replay requires the VLA language-model backbone")
         allocated_before = torch.cuda.memory_allocated() / 2**20
         reserved_before = torch.cuda.memory_reserved() / 2**20
         nvml_before = _nvml_process_memory_mib()
@@ -206,10 +219,10 @@ class PyTorchFastLLMBackend(BaseLLMBackend):
         start.record()
         output = language_model(
             input_ids=None,
-            attention_mask=llm_inputs["attention_mask"],
+            attention_mask=attention_mask,
             position_ids=None,
             past_key_values=None,
-            inputs_embeds=llm_inputs["inputs_embeds"],
+            inputs_embeds=inputs_embeds,
             use_cache=False,
             output_attentions=False,
             output_hidden_states=False,
@@ -589,6 +602,7 @@ class TensorRTEdgeBackend(TensorRTLLMBackend):
         )
         self.last_llm_inference_ms: Optional[float] = None
         self.last_llm_memory_mib: dict[str, float] = {}
+        self._worker: Optional[subprocess.Popen[str]] = None
         required = [
             os.path.join(self.engine_dir, "llm.engine"),
             os.path.join(self.engine_dir, "config.json"),
@@ -599,10 +613,32 @@ class TensorRTEdgeBackend(TensorRTLLMBackend):
         if missing:
             raise FileNotFoundError("TensorRT engine backend is missing required file(s): " + ", ".join(missing))
 
+    def _worker_process(self) -> subprocess.Popen[str]:
+        if self._worker is not None and self._worker.poll() is None:
+            return self._worker
+        self._worker = subprocess.Popen(
+            [self.runner_path, os.path.join(self.engine_dir, "llm.engine"), self.plugin_path],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, bufsize=1,
+        )
+        assert self._worker.stdout is not None
+        if self._worker.stdout.readline().strip() != "READY":
+            self._worker.kill()
+            raise RuntimeError("TensorRT persistent runner did not become ready")
+        return self._worker
+
+    def __del__(self) -> None:
+        if self._worker is not None and self._worker.poll() is None:
+            self._worker.terminate()
+
     def forward_action_hidden_states(self, vla: nn.Module, inputs: LLMBackendInputs) -> torch.Tensor:
         llm_inputs = self._prepare_action_forward_inputs(vla, inputs)
-        full_embeds = llm_inputs["inputs_embeds"].detach()
-        attention_mask = llm_inputs["attention_mask"].detach().to(torch.bool)
+        return self.forward_cached_hidden_states(llm_inputs["inputs_embeds"], llm_inputs["attention_mask"])
+
+    def forward_cached_hidden_states(
+        self, inputs_embeds: torch.Tensor, attention_mask: torch.Tensor, vla: Optional[nn.Module] = None
+    ) -> torch.Tensor:
+        full_embeds = inputs_embeds.detach()
+        attention_mask = attention_mask.detach().to(torch.bool)
         if full_embeds.shape[0] != 1:
             raise ValueError(f"TensorRT engine backend supports batch_size=1, got {full_embeds.shape[0]}")
 
@@ -623,32 +659,23 @@ class TensorRTEdgeBackend(TensorRTLLMBackend):
             input_dir = Path(tmpdir) / "input"
             output_dir = Path(tmpdir) / "output"
             input_dir.mkdir()
+            output_dir.mkdir()
             compact_embeds.numpy().tofile(input_dir / "inputs_embeds_fp16.bin")
             padded_rope = torch.zeros((1, self.kv_cache_capacity, rope.shape[-1]), dtype=torch.float32)
             padded_rope[:, :sequence_length] = rope
             padded_rope.numpy().tofile(input_dir / "rope_rotary_cos_sin_fp32.bin")
-            completed = subprocess.run(
-                [
-                    self.runner_path, os.path.join(self.engine_dir, "llm.engine"), self.plugin_path,
-                    str(input_dir), str(output_dir), str(sequence_length), str(self.kv_cache_capacity),
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if completed.returncode != 0:
-                raise RuntimeError(f"TensorRT engine failed: {completed.stderr[-2000:]}")
-            self.last_llm_inference_ms = next(
-                (float(line.split("=", 1)[1]) for line in completed.stdout.splitlines() if line.startswith("engine_enqueue_ms=")),
-                None,
-            )
-            if self.last_llm_inference_ms is None:
-                raise RuntimeError("TensorRT engine did not report engine_enqueue_ms")
+            worker = self._worker_process()
+            assert worker.stdin is not None and worker.stdout is not None
+            output_path = output_dir / "hidden_states_fp16.bin"
+            worker.stdin.write(f"{input_dir} {output_path} {sequence_length} {self.kv_cache_capacity}\n")
+            worker.stdin.flush()
+            response = worker.stdout.readline().strip().split()
+            if len(response) != 4 or response[0] != "OK":
+                raise RuntimeError("TensorRT persistent runner failed: " + " ".join(response))
+            self.last_llm_inference_ms = float(response[1])
             self.last_llm_memory_mib = {
-                key: float(line.split("=", 1)[1])
-                for line in completed.stdout.splitlines()
-                if line.startswith("engine_cuda_used_mib_")
-                for key in [line.split("=", 1)[0]]
+                "engine_cuda_used_mib_before_enqueue": float(response[2]),
+                "engine_cuda_used_mib_after_enqueue": float(response[3]),
             }
             hidden_np = np.fromfile(output_dir / "hidden_states_fp16.bin", dtype=np.float16)
 
